@@ -191,8 +191,9 @@ render_line() {
         printf '%s%s %sv%s%s' "$(icon_color)" "$(reset_color)" "$(cc_version_color)" "$CC_VERSION" "$(reset_color)"
     fi
 
-    # Context window usage
-    if [[ -n "$CONTEXT_USED_PCT" ]]; then
+    # Context window usage (default to 0 when not yet available)
+    [[ -z "$CONTEXT_USED_PCT" ]] && CONTEXT_USED_PCT=0
+    {
         local int_pct="${CONTEXT_USED_PCT%%.*}"
         [[ -z "$int_pct" ]] && int_pct=0
 
@@ -211,7 +212,7 @@ render_line() {
 
         printf '%s' "$sep"
         printf '\033[1mStress: %s%s%s' "$(usage_color)" "$skulls" "$(reset_color)"
-    fi
+    }
 
     # Claude API Usage from main.go
     local api_usage
