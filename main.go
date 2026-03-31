@@ -6,15 +6,16 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
-
-	"github.com/joho/godotenv"
 )
 
 const (
-	DefaultVersion = "2.1.20"
-	AnthropicBeta  = "oauth-2025-04-20"
+	DefaultVersion  = "2.1.87"
+	AnthropicBeta   = "oauth-2025-04-20"
+	KeychainService = "Claude Code-credentials"
+	ApiUrl          = "https://api.anthropic.com/api/oauth/usage"
 )
 
 // SecurityOutput represents the JSON structure stored in Keychain
@@ -40,24 +41,6 @@ type InputData struct {
 	Version string `json:"version"`
 }
 
-// Config holds the application configuration
-type Config struct {
-	KeychainService string
-	APIURL          string
-}
-
-// loadConfig reads from .env file using godotenv
-func loadConfig() Config {
-	// Load .env file (if exists, it sets process env vars)
-	_ = godotenv.Load()
-
-	// Read from Environment Variables
-	return Config{
-		KeychainService: os.Getenv("KEYCHAIN_SERVICE"),
-		APIURL:          os.Getenv("API_URL"),
-	}
-}
-
 func getCredentials(serviceName string) (string, error) {
 	cmd := exec.Command("security", "find-generic-password", "-s", serviceName, "-w")
 	output, err := cmd.Output()
@@ -77,8 +60,8 @@ func getCredentials(serviceName string) (string, error) {
 	return credentials.ClaudeAiOauth.AccessToken, nil
 }
 
-func fetchUsage(token string, version string, config Config) (*UsageResponse, error) {
-	req, err := http.NewRequest("GET", config.APIURL, nil)
+func fetchUsage(token string, version string) (*UsageResponse, error) {
+	req, err := http.NewRequest("GET", ApiUrl, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -110,10 +93,10 @@ func fetchUsage(token string, version string, config Config) (*UsageResponse, er
 	}
 
 	// Output raw API response as formatted JSON
-	var prettyJSON map[string]interface{}
-	json.Unmarshal(rawJSON, &prettyJSON)
-	formatted, _ := json.MarshalIndent(prettyJSON, "", "  ")
-	fmt.Println(string(formatted))
+	//var prettyJSON map[string]interface{}
+	//json.Unmarshal(rawJSON, &prettyJSON)
+	//formatted, _ := json.MarshalIndent(prettyJSON, "", "  ")
+	//fmt.Println(string(formatted))
 
 	var usage UsageResponse
 	if err := json.Unmarshal(rawJSON, &usage); err != nil {
@@ -131,59 +114,121 @@ func formatOutput(usage *UsageResponse) string {
 	var parts []string
 
 	if usage.FiveHour != nil {
+		//green := "\033[1;38;2;0;175;80m"
+		//orange := "\033[1;38;2;255;115;0m"
+		red := "\033[1;38;2;255;40;0m"
+		reset := "\033[0m"
+		heart := "\U000F02D1"
+		halfHeart := "\U000F06DE"
+		brokeHeart := "\U000F02D5"
+
+		utilization := usage.FiveHour.Utilization
+		color := red
+
+		brokenCount := int(utilization) / 10
+		halfCount := 0
+		if int(utilization)%10 >= 5 || (utilization > 0 && utilization < 5) {
+			halfCount = 1
+		}
+		fullCount := 10 - brokenCount - halfCount
+
+		bar := make([]string, 10)
+		for i := 0; i < 10; i++ {
+			if i < fullCount {
+				bar[i] = heart
+			} else if i < fullCount+halfCount {
+				bar[i] = halfHeart
+			} else {
+				bar[i] = brokeHeart
+			}
+		}
+		barStr := strings.Join(bar, " ")
+
 		if usage.FiveHour.ResetsAt != nil {
-			resetTime := usage.FiveHour.ResetsAt.Local().Format("15:04")
-			parts = append(parts, fmt.Sprintf("5h: %.0f%% (Reset %s)", usage.FiveHour.Utilization, resetTime))
+			resetTime := usage.FiveHour.ResetsAt.Local().Format("15:04 PM")
+			parts = append(parts, fmt.Sprintf("\033[1mLife: %s%s%s  (%s)", color, barStr, reset, resetTime))
 		} else {
-			parts = append(parts, fmt.Sprintf("5h: %.0f%%", usage.FiveHour.Utilization))
+			parts = append(parts, fmt.Sprintf("\033[1mLife: %s%s%s", color, barStr, reset))
 		}
 	}
 
 	return strings.Join(parts, " | ")
 }
 
-func main() {
-	// 1. Load Configuration
-	config := loadConfig()
+func readCache() (*UsageResponse, error) {
+	cacheFile := filepath.Join(os.TempDir(), "claude_usage_cache.json")
+	if info, err := os.Stat(cacheFile); err == nil && time.Since(info.ModTime()) < 5*time.Minute {
+		if data, err := os.ReadFile(cacheFile); err == nil {
+			var usage UsageResponse
+			if err := json.Unmarshal(data, &usage); err == nil {
+				return &usage, nil
+			}
+		}
+	}
+	return nil, fmt.Errorf("cache miss or expired")
+}
 
-	if config.KeychainService == "" || config.APIURL == "" {
-		fmt.Printf("Error: Missing required configuration. Please check KEYCHAIN_SERVICE and API_URL in .env or environment variables.\n")
+func writeCache(usage *UsageResponse) {
+	cacheFile := filepath.Join(os.TempDir(), "claude_usage_cache.json")
+
+	data, err := json.Marshal(usage)
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "Warning: failed to marshal cache data: %v\n", err)
 		return
 	}
 
-	// Try to read version from stdin with a short timeout to prevent blocking in IDEs
-	// This approach is more robust than checking file mode bits
+	if err := os.WriteFile(cacheFile, data, 0644); err != nil {
+		// 使用 _, _ = 來明確放棄 Fprintf 本身的錯誤回傳值，平息 IDE 警告
+		_, _ = fmt.Fprintf(os.Stderr, "Warning: failed to write cache: %v\n", err)
+	}
+}
+
+func readInputWithTimeout(timeout time.Duration) InputData {
 	inputChan := make(chan InputData, 1)
 	go func() {
 		var input InputData
-		// We use a new scanner/decoder to check if there is actual content
-		// If Stdin is empty or blocking, this goroutine will just hang (which is fine, main will timeout)
+		// 如果 Stdin 沒有資料，這個 Goroutine 會阻塞，但在背景不影響主程式
 		if err := json.NewDecoder(os.Stdin).Decode(&input); err == nil {
 			inputChan <- input
 		}
 		close(inputChan)
 	}()
 
-	var input InputData
 	select {
 	case data := <-inputChan:
-		input = data
-	case <-time.After(100 * time.Millisecond):
-		// Timeout reached, assume no input provided
-		// Proceeding with zero-valued input (empty Version)
+		return data
+	case <-time.After(timeout):
+		// 超時未收到資料，回傳空的結構（代表使用預設版本）
+		return InputData{}
+	}
+}
+
+func main() {
+	// 1. 檢查快取 (5 分鐘內有效)
+	if usage, err := readCache(); err == nil && usage != nil {
+		// 命中快取，直接輸出結果並結束，不呼叫 API
+		fmt.Println(formatOutput(usage))
+		return
 	}
 
-	token, err := getCredentials(config.KeychainService)
+	// 2. 嘗試讀取 Stdin 中外部傳來的版本參數
+	input := readInputWithTimeout(100 * time.Millisecond)
+
+	// 3. 快取無效或過期，從 Keychain 拿憑證並呼叫 API
+	token, err := getCredentials(KeychainService)
 	if err != nil {
 		fmt.Printf("Error getting credentials: %v\n", err)
 		return
 	}
 
-	usage, err := fetchUsage(token, input.Version, config)
+	usage, err := fetchUsage(token, input.Version)
 	if err != nil {
 		fmt.Printf("Error fetching usage: %v\n", err)
 		return
 	}
 
-	fmt.Print(formatOutput(usage))
+	// 5. 把剛剛取得的新結果存入快取，供未來 5 分鐘使用 (並處理錯誤)
+	writeCache(usage)
+
+	fmt.Println(formatOutput(usage))
 }
